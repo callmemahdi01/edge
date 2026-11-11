@@ -28,7 +28,7 @@ Commercial support is available at
 
 <p><em>Thank you for using nginx.</em></p>
 </body>
-</html>`;
+</html>\r\n`;
 
 const NGINX_404 = `<html>
 <head><title>404 Not Found</title></head>
@@ -36,15 +36,26 @@ const NGINX_404 = `<html>
 <center><h1>404 Not Found</h1></center>
 <hr><center>nginx</center>
 </body>
-</html>`;
+</html>\r\n`;
 
 export default {
   async fetch(req) {
-    if (req.headers.get("Upgrade") !== "websocket") {
-      const { pathname } = new URL(req.url);
-      const isRoot = pathname === "/" || pathname === "/index.html";
-      return new Response(isRoot ? NGINX_PAGE : NGINX_404, {
-        status: isRoot ? 200 : 404,
+    const url = new URL(req.url);
+    const isWs = req.headers.get("Upgrade") === "websocket";
+
+    if (isWs && url.pathname === WS_PATH) {
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      server.binaryType = "arraybuffer";
+      server.send(new Uint8Array([0, 0]));
+
+      handleTraffic(server, url.searchParams.get("proxyip"));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    if (url.pathname === "/") {
+      return new Response(NGINX_PAGE, {
+        status: 200,
         headers: {
           "Content-Type": "text/html",
           "Server": "nginx"
@@ -52,21 +63,13 @@ export default {
       });
     }
 
-    const url = new URL(req.url);
-    if (url.pathname !== WS_PATH) {
-      return new Response(NGINX_404, {
-        status: 404,
-        headers: { "Content-Type": "text/html", "Server": "nginx" }
-      });
-    }
-
-    const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-    server.binaryType = "arraybuffer";
-    server.send(new Uint8Array([0, 0]));
-
-    handleTraffic(server, url.searchParams.get("proxyip"));
-    return new Response(null, { status: 101, webSocket: client });
+    return new Response(NGINX_404, {
+      status: 404,
+      headers: {
+        "Content-Type": "text/html",
+        "Server": "nginx"
+      }
+    });
   }
 };
 
