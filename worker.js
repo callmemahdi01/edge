@@ -1,8 +1,12 @@
 import { connect } from "cloudflare:sockets";
 
 let مسیر_اشتراک = "مسیر-اشتراک";
-let شناسه_تایید;
-let آی_پی_های_پروکسی = ["proxyip.cmliussss.net"];
+let شناسه_تایید = "7b102311-43fd-4e8f-877e-8090623c101d";
+let آی_پی_های_پروکسی = [
+  "proxyip.cmliussss.net",
+  "proxyip.us.fxxk.dedyn.io",
+  "proxyip.sg.fxxk.dedyn.io"
+];
 
 const فرمت_کلید = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
 
@@ -50,8 +54,7 @@ p {
 
 export default {
   async fetch(درخواست, env) {
-    مسیر_اشتراک = env.SUB_PATH ?? مسیر_اشتراک;
-    شناسه_تایید = env.UUID ?? شناسه_تایید ?? ایجاد_شناسه();
+    شناسه_تایید = env.UUID ?? شناسه_تایید;
     if (env.PROXY_IP) آی_پی_های_پروکسی = تفکیک_ارایه(env.PROXY_IP);
 
     const url = new URL(درخواست.url);
@@ -180,19 +183,6 @@ async function راه‌اندازی_خط_لوله(رابط_وب_سوکت, پر�
       })
     );
   }
-}
-
-function ایجاد_شناسه() {
-  const بیست_کاراکتر = Array.from(new TextEncoder().encode(مسیر_اشتراک))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("")
-    .slice(0, 20)
-    .padEnd(20, "0");
-
-  const هشت_کاراکتر_اول = بیست_کاراکتر.slice(0, 8);
-  const دوازده_کاراکتر_آخر = بیست_کاراکتر.slice(-12);
-
-  return `${هشت_کاراکتر_اول}-0000-4000-8000-${دوازده_کاراکتر_آخر}`;
 }
 
 function تفکیک_ارایه(ورودی) {
