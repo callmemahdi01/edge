@@ -1,6 +1,6 @@
 import { connect } from "cloudflare:sockets";
 
-const WS_PATH = "/vless-ws";
+const WS_PATH = "/home/go.html";
 const PROXY_IP = "proxyip.cmliussss.net";
 
 const UUID_HI = 0xd342d11ed4244583n;
