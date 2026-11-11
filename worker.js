@@ -1,11 +1,12 @@
 import { connect } from "cloudflare:sockets";
 
-let مسیر_اشتراک = "مسیر-اشتراک";
-let شناسه_تایید = "7b102311-43fd-4e8f-877e-8090623c101d";
-let آی_پی_های_پروکسی = [
-  "proxyip.cmliussss.net",
-  "proxyip.us.fxxk.dedyn.io",
-  "proxyip.sg.fxxk.dedyn.io"
+const شناسه_تایید = "7b102311-43fd-4e8f-877e-8090623c101d";
+const مسیر_مجاز = "/go.html";
+
+const آی_پی_های_پروکسی = [
+  "104.16.1.1:443",
+  "104.17.1.1:443",
+  "proxyip.cmliussss.net:443"
 ];
 
 const فرمت_کلید = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
@@ -54,41 +55,26 @@ p {
 
 export default {
   async fetch(درخواست, env) {
-    شناسه_تایید = env.UUID ?? شناسه_تایید;
-    if (env.PROXY_IP) آی_پی_های_پروکسی = تفکیک_ارایه(env.PROXY_IP);
-
     const url = new URL(درخواست.url);
-    const هدر_ارتقا = درخواست.headers.get("Upgrade");
-    const درخواست_وب_سوکت = هدر_ارتقا == "websocket";
-
-    const مسیر_جاری = decodeURIComponent(url.pathname);
-    const مسیر_ریشه = مسیر_جاری === "/" || مسیر_جاری === "";
+    const هدر_ارتقا = درخواست.headers.get("Upgrade") || "";
+    const درخواست_وب_سوکت = هدر_ارتقا.toLowerCase() === "websocket";
 
     if (!درخواست_وب_سوکت) {
-      if (مسیر_ریشه) {
-        return new Response(صفحه_اصلی_انجین‌ایکس, {
-          status: 200,
-          headers: { "Content-Type": "text/html;charset=utf-8" },
-        });
-      }
-      return new Response("Not Found", { status: 404 });
+      return new Response(صفحه_اصلی_انجین‌ایکس, {
+        status: 200,
+        headers: { "Content-Type": "text/html;charset=utf-8" },
+      });
     }
 
-    if (درخواست_وب_سوکت) {
-      const پروکسی_سفارشی = url.searchParams.get("proxyip");
-      return await ارتقا_به_وب_سوکت(پروکسی_سفارشی);
-    }
+    const پروکسی_سفارشی = url.searchParams.get("proxyip");
+    const [کلاینت, رابط_وب_سوکت] = Object.values(new WebSocketPair());
+    رابط_وب_سوکت.accept();
+    رابط_وب_سوکت.binaryType = "arraybuffer";
+
+    راه‌اندازی_خط_لوله(رابط_وب_سوکت, پروکسی_سفارشی);
+    return new Response(null, { status: 101, webSocket: کلاینت });
   },
 };
-
-async function ارتقا_به_وب_سوکت(پروکسی_سفارشی) {
-  const [کلاینت, رابط_وب_سوکت] = Object.values(new WebSocketPair());
-  رابط_وب_سوکت.accept();
-  رابط_وب_سوکت.binaryType = "arraybuffer";
-  رابط_وب_سوکت.send(new Uint8Array([0, 0]));
-  راه‌اندازی_خط_لوله(رابط_وب_سوکت, پروکسی_سفارشی);
-  return new Response(null, { status: 101, webSocket: کلاینت });
-}
 
 async function راه‌اندازی_خط_لوله(رابط_وب_سوکت, پروکسی_سفارشی) {
   let رابط_تی‌سی‌پی;
@@ -98,17 +84,41 @@ async function راه‌اندازی_خط_لوله(رابط_وب_سوکت, پر�
 
   رابط_وب_سوکت.addEventListener("message", (event) => {
     صف_پردازش = صف_پردازش.then(async () => {
-      if (داده_اولیه) {
-        داده_اولیه = false;
-        await تجزیه_هدر_ویلس(event.data);
-      } else {
-        await داده_انتقالی.write(event.data);
+      try {
+        if (داده_اولیه) {
+          داده_اولیه = false;
+          await تجزیه_هدر_ویلس(event.data);
+        } else {
+          if (داده_انتقالی) {
+            await داده_انتقالی.write(event.data);
+          }
+        }
+      } catch (err) {
+        رابط_وب_سوکت.close();
       }
     });
   });
 
+  رابط_وب_سوکت.addEventListener("close", () => {
+    if (رابط_تی‌سی‌پی) {
+      try { رابط_تی‌سی‌پی.close(); } catch {}
+    }
+  });
+
+  رابط_وب_سوکت.addEventListener("error", () => {
+    if (رابط_تی‌سی‌پی) {
+      try { رابط_تی‌سی‌پی.close(); } catch {}
+    }
+  });
+
   async function تجزیه_هدر_ویلس(داده_ویلس) {
+    if (داده_ویلس.byteLength < 18) {
+      رابط_وب_سوکت.close();
+      return;
+    }
+
     if (بررسی_کلید_ویلس(new Uint8Array(داده_ویلس.slice(1, 17))) !== شناسه_تایید) {
+      رابط_وب_سوکت.close();
       return;
     }
 
@@ -145,6 +155,7 @@ async function راه‌اندازی_خط_لوله(رابط_وب_سوکت, پر�
         آدرس_مقصد = ipv6.join(":");
         break;
       default:
+        رابط_وب_سوکت.close();
         return;
     }
 
@@ -154,18 +165,24 @@ async function راه‌اندازی_خط_لوله(رابط_وب_سوکت, پر�
       رابط_تی‌سی‌پی = connect({ hostname: آدرس_مقصد, port: پورت_مقصد });
       await رابط_تی‌سی‌پی.opened;
     } catch {
-      const پروکسی_انتخابی = پروکسی_سفارشی || آی_پی_های_پروکسی[Math.floor(Math.random() * آی_پی_های_پروکسی.length)] || "proxyip.cmliussss.net";
+      const پروکسی_انتخابی = پروکسی_سفارشی || آی_پی_های_پروکسی[Math.floor(Math.random() * آی_پی_های_پروکسی.length)];
       const [آدرس_آی_پی_پروکسی, پورت_آی_پی_پروکسی = پورت_مقصد] = پروکسی_انتخابی.split(":");
       رابط_تی‌سی‌پی = connect({ hostname: آدرس_آی_پی_پروکسی, port: Number(پورت_آی_پی_پروکسی) });
       await رابط_تی‌سی‌پی.opened;
     }
 
+    رابط_وب_سوکت.send(new Uint8Array([0, 0]));
     ایجاد_خط_انتقال(نوشتن_داده_اولیه);
   }
 
   function بررسی_کلید_ویلس(arr, offset = 0) {
-    const uuid = (فرمت_کلید[arr[offset + 0]] + فرمت_کلید[arr[offset + 1]] + فرمت_کلید[arr[offset + 2]] + فرمت_کلید[arr[offset + 3]] + "-" + فرمت_کلید[arr[offset + 4]] + فرمت_کلید[arr[offset + 5]] + "-" + فرمت_کلید[arr[offset + 6]] + فرمت_کلید[arr[offset + 7]] + "-" + فرمت_کلید[arr[offset + 8]] + فرمت_کلید[arr[offset + 9]] + "-" + فرمت_کلید[arr[offset + 10]] + فرمت_کلید[arr[offset + 11]] + فرمت_کلید[arr[offset + 12]] + فرمت_کلید[arr[offset + 13]] + فرمت_کلید[arr[offset + 14]] + فرمت_کلید[arr[offset + 15]]).toLowerCase();
-    return uuid;
+    return (
+      فرمت_کلید[arr[offset + 0]] + فرمت_کلید[arr[offset + 1]] + فرمت_کلید[arr[offset + 2]] + فرمت_کلید[arr[offset + 3]] + "-" +
+      فرمت_کلید[arr[offset + 4]] + فرمت_کلید[arr[offset + 5]] + "-" +
+      فرمت_کلید[arr[offset + 6]] + فرمت_کلید[arr[offset + 7]] + "-" +
+      فرمت_کلید[arr[offset + 8]] + فرمت_کلید[arr[offset + 9]] + "-" +
+      فرمت_کلید[arr[offset + 10]] + فرمت_کلید[arr[offset + 11]] + فرمت_کلید[arr[offset + 12]] + فرمت_کلید[arr[offset + 13]] + فرمت_کلید[arr[offset + 14]] + فرمت_کلید[arr[offset + 15]]
+    ).toLowerCase();
   }
 
   async function ایجاد_خط_انتقال(نوشتن_داده_اولیه) {
@@ -178,17 +195,17 @@ async function راه‌اندازی_خط_لوله(رابط_وب_سوکت, پر�
     رابط_تی‌سی‌پی.readable.pipeTo(
       new WritableStream({
         write(chunk) {
-          رابط_وب_سوکت.send(chunk);
+          try {
+            رابط_وب_سوکت.send(chunk);
+          } catch {}
         },
+        close() {
+          try { رابط_وب_سوکت.close(); } catch {}
+        },
+        abort() {
+          try { رابط_وب_سوکت.close(); } catch {}
+        }
       })
-    );
+    ).catch(() => {});
   }
-}
-
-function تفکیک_ارایه(ورودی) {
-  if (Array.isArray(ورودی)) return ورودی;
-  if (typeof ورودی === "string") {
-    return ورودی.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean);
-  }
-  return [];
 }
