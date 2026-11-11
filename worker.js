@@ -1,179 +1,204 @@
-import { connect } from 'cloudflare:sockets';
+import { connect } from "cloudflare:sockets";
 
-const PAGE = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome to nginx!</title><style>html{color-scheme:light}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;background:#fff;color:#000}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p><p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br>Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p><p><em>Thank you for using nginx.</em></p></body></html>';
-const DEFAULT_PROXY = 'proxyip.cmliussss.net';
-const DNS_HOST = '8.8.4.4';
-const DIAL_TIMEOUT = 3000;
-const MAX_QUEUE = 8 << 20;
-const READY = new Uint8Array([0, 0]);
+let مسیر_اشتراک = "مسیر-اشتراک";
+let شناسه_تایید;
+let آی_پی_های_پروکسی = ["proxyip.cmliussss.net"];
 
-let rawId;
-let idBytes;
+const فرمت_کلید = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
 
-function getId(raw) {
-  if (raw !== rawId) {
-    rawId = raw;
-    const h = typeof raw === 'string' ? raw.trim().replace(/-/g, '') : '';
-    idBytes = /^[0-9a-fA-F]{32}$/.test(h) ? Uint8Array.from(h.match(/../g), (x) => parseInt(x, 16)) : null;
-  }
-  return idBytes;
+const صفحه_اصلی_انجین‌ایکس = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Welcome to nginx!</title>
+<style>
+body {
+    background-color: #ffffff;
+    color: #000000;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    margin: 0;
 }
-
-function parseProxy(v) {
-  const m = typeof v === 'string' && v.trim() !== '0' && /^(?:\[([^\]]+)\]|([^:\s]+))(?::(\d+))?$/.exec(v.trim());
-  return m ? { hostname: m[1] || m[2], port: +m[3] || 0 } : null;
+.box {
+    border: 1px solid #cccccc;
+    padding: 30px 40px;
+    max-width: 550px;
+    text-align: center;
 }
-
-function parseHeader(b, id) {
-  if (b.length < 22) return null;
-  for (let i = 0; i < 16; i++) if (b[1 + i] !== id[i]) return null;
-  let o = 18 + b[17];
-  if (o + 4 > b.length) return null;
-  const cmd = b[o];
-  const port = (b[o + 1] << 8) | b[o + 2];
-  const type = b[o + 3];
-  o += 4;
-  let host;
-  if (type === 1) {
-    if (o + 4 > b.length) return null;
-    host = b.subarray(o, o + 4).join('.');
-    o += 4;
-  } else if (type === 2) {
-    const l = b[o++];
-    if (!l || o + l > b.length) return null;
-    host = new TextDecoder().decode(b.subarray(o, o + l));
-    o += l;
-  } else if (type === 3) {
-    if (o + 16 > b.length) return null;
-    const dv = new DataView(b.buffer, b.byteOffset + o, 16);
-    const parts = [];
-    for (let i = 0; i < 8; i++) parts.push(dv.getUint16(i * 2).toString(16));
-    host = parts.join(':');
-    o += 16;
-  } else {
-    return null;
-  }
-  if (cmd === 1) return { host, port, offset: o };
-  return cmd === 2 && port === 53 ? { host: DNS_HOST, port, offset: o } : null;
+h1 {
+    font-size: 22px;
+    margin: 0 0 16px 0;
 }
-
-function decodeEarly(p, id) {
-  if (!p || p.length > 11000) return null;
-  try {
-    const b = Uint8Array.from(atob(p.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
-    return b.length > 17 && id.every((v, i) => b[1 + i] === v) ? b : null;
-  } catch {
-    return null;
-  }
+p {
+    font-size: 14px;
+    line-height: 1.6;
+    margin: 0 0 12px 0;
 }
-
-function kill(s) {
-  try { Promise.resolve(s.close()).catch(() => {}); } catch {}
-}
-
-async function dial(hostname, port) {
-  const s = connect({ hostname, port });
-  s.closed.catch(() => {});
-  let timer;
-  try {
-    await Promise.race([
-      s.opened,
-      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), DIAL_TIMEOUT); }),
-    ]);
-    return s;
-  } catch (e) {
-    kill(s);
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function tunnel(ws, id, proxy, early) {
-  let sock, writer;
-  let target = '-', got = false, done = false, queued = 0, chain = Promise.resolve();
-
-  const shut = () => {
-    if (done) return;
-    done = true;
-    if (sock) kill(sock);
-    try { ws.close(1000); } catch {}
-  };
-
-  const fail = (e) => {
-    console.log(target, (e && e.message) || e);
-    shut();
-  };
-
-  const pump = async (s) => {
-    const reader = s.readable.getReader();
-    try {
-      for (;;) {
-        const { done: end, value } = await reader.read();
-        if (end || done) break;
-        got = true;
-        ws.send(value);
-      }
-    } catch {}
-    if (!got) console.log(target, 'closed without data');
-    shut();
-  };
-
-  const open = async (bytes) => {
-    const h = parseHeader(bytes, id);
-    if (!h) throw new Error('bad header');
-    target = h.host + ':' + h.port;
-    let s;
-    try {
-      s = await dial(h.host, h.port);
-    } catch (e) {
-      if (!proxy) throw e;
-      s = await dial(proxy.hostname, proxy.port || h.port);
-    }
-    if (done) return kill(s);
-    sock = s;
-    writer = s.writable.getWriter();
-    pump(s).catch(fail);
-    const first = bytes.subarray(h.offset);
-    if (first.length) await writer.write(first);
-  };
-
-  const push = (d) => {
-    const size = d.byteLength ?? d.size;
-    queued += size;
-    if (queued > MAX_QUEUE) return shut();
-    chain = chain.then(async () => {
-      queued -= size;
-      if (done) return;
-      const bytes = new Uint8Array(d instanceof ArrayBuffer ? d : await d.arrayBuffer());
-      if (writer) await writer.write(bytes);
-      else await open(bytes);
-    }).catch(fail);
-  };
-
-  ws.addEventListener('message', (e) => {
-    if (typeof e.data === 'string') shut();
-    else push(e.data);
-  });
-  ws.addEventListener('close', () => { chain = chain.then(shut); });
-  ws.addEventListener('error', shut);
-  if (early) push(early.buffer);
-}
+</style>
+</head>
+<body>
+<div class="box">
+    <h1>Welcome to nginx!</h1>
+    <p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+    <p><em>Thank you for using nginx.</em></p>
+</div>
+</body>
+</html>`;
 
 export default {
-  async fetch(req, env) {
-    if ((req.headers.get('upgrade') || '').toLowerCase() === 'websocket') {
-      const id = getId(env.UUID);
-      if (!id) return new Response('Server Error', { status: 500 });
-      const [client, server] = Object.values(new WebSocketPair());
-      server.binaryType = 'arraybuffer';
-      server.accept();
-      server.send(READY);
-      tunnel(server, id, parseProxy(env.PROXYIP ?? DEFAULT_PROXY), decodeEarly(req.headers.get('sec-websocket-protocol'), id));
-      return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
+  async fetch(درخواست, env) {
+    مسیر_اشتراک = env.SUB_PATH ?? مسیر_اشتراک;
+    شناسه_تایید = env.UUID ?? شناسه_تایید ?? ایجاد_شناسه();
+    if (env.PROXY_IP) آی_پی_های_پروکسی = تفکیک_ارایه(env.PROXY_IP);
+
+    const url = new URL(درخواست.url);
+    const هدر_ارتقا = درخواست.headers.get("Upgrade");
+    const درخواست_وب_سوکت = هدر_ارتقا == "websocket";
+
+    const مسیر_جاری = decodeURIComponent(url.pathname);
+    const مسیر_ریشه = مسیر_جاری === "/" || مسیر_جاری === "";
+
+    if (!درخواست_وب_سوکت) {
+      if (مسیر_ریشه) {
+        return new Response(صفحه_اصلی_انجین‌ایکس, {
+          status: 200,
+          headers: { "Content-Type": "text/html;charset=utf-8" },
+        });
+      }
+      return new Response("Not Found", { status: 404 });
     }
-    if (new URL(req.url).pathname !== '/') return new Response('Not Found', { status: 404 });
-    if (req.method !== 'GET' && req.method !== 'HEAD') return new Response(null, { status: 405, headers: { allow: 'GET, HEAD' } });
-    return new Response(req.method === 'HEAD' ? null : PAGE, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+
+    if (درخواست_وب_سوکت) {
+      const پروکسی_سفارشی = url.searchParams.get("proxyip");
+      return await ارتقا_به_وب_سوکت(پروکسی_سفارشی);
+    }
   },
 };
+
+async function ارتقا_به_وب_سوکت(پروکسی_سفارشی) {
+  const [کلاینت, رابط_وب_سوکت] = Object.values(new WebSocketPair());
+  رابط_وب_سوکت.accept();
+  رابط_وب_سوکت.binaryType = "arraybuffer";
+  رابط_وب_سوکت.send(new Uint8Array([0, 0]));
+  راه‌اندازی_خط_لوله(رابط_وب_سوکت, پروکسی_سفارشی);
+  return new Response(null, { status: 101, webSocket: کلاینت });
+}
+
+async function راه‌اندازی_خط_لوله(رابط_وب_سوکت, پروکسی_سفارشی) {
+  let رابط_تی‌سی‌پی;
+  let داده_اولیه = true;
+  let صف_پردازش = Promise.resolve();
+  let داده_انتقالی;
+
+  رابط_وب_سوکت.addEventListener("message", (event) => {
+    صف_پردازش = صف_پردازش.then(async () => {
+      if (داده_اولیه) {
+        داده_اولیه = false;
+        await تجزیه_هدر_ویلس(event.data);
+      } else {
+        await داده_انتقالی.write(event.data);
+      }
+    });
+  });
+
+  async function تجزیه_هدر_ویلس(داده_ویلس) {
+    if (بررسی_کلید_ویلس(new Uint8Array(داده_ویلس.slice(1, 17))) !== شناسه_تایید) {
+      return;
+    }
+
+    const موقعیت_داده = new Uint8Array(داده_ویلس)[17];
+    const شاخص_پورت = 18 + موقعیت_داده + 1;
+    const بافر_پورت = داده_ویلس.slice(شاخص_پورت, شاخص_پورت + 2);
+    const پورت_مقصد = new DataView(بافر_پورت).getUint16(0);
+
+    const شاخص_آدرس = شاخص_پورت + 2;
+    const بافر_آدرس = new Uint8Array(داده_ویلس.slice(شاخص_آدرس, شاخص_آدرس + 1));
+    const نوع_آدرس = بافر_آدرس[0];
+
+    let طول_آدرس = 0;
+    let آدرس_مقصد = "";
+    let شاخص_اطلاعات_آدرس = شاخص_آدرس + 1;
+
+    switch (نوع_آدرس) {
+      case 1:
+        طول_آدرس = 4;
+        آدرس_مقصد = new Uint8Array(داده_ویلس.slice(شاخص_اطلاعات_آدرس, شاخص_اطلاعات_آدرس + طول_آدرس)).join(".");
+        break;
+      case 2:
+        طول_آدرس = new Uint8Array(داده_ویلس.slice(شاخص_اطلاعات_آدرس, شاخص_اطلاعات_آدرس + 1))[0];
+        شاخص_اطلاعات_آدرس += 1;
+        آدرس_مقصد = new TextDecoder().decode(داده_ویلس.slice(شاخص_اطلاعات_آدرس, شاخص_اطلاعات_آدرس + طول_آدرس));
+        break;
+      case 3:
+        طول_آدرس = 16;
+        const dataView = new DataView(داده_ویلس.slice(شاخص_اطلاعات_آدرس, شاخص_اطلاعات_آدرس + طول_آدرس));
+        const ipv6 = [];
+        for (let i = 0; i < 8; i++) {
+          ipv6.push(dataView.getUint16(i * 2).toString(16));
+        }
+        آدرس_مقصد = ipv6.join(":");
+        break;
+      default:
+        return;
+    }
+
+    const نوشتن_داده_اولیه = داده_ویلس.slice(شاخص_اطلاعات_آدرس + طول_آدرس);
+
+    try {
+      رابط_تی‌سی‌پی = connect({ hostname: آدرس_مقصد, port: پورت_مقصد });
+      await رابط_تی‌سی‌پی.opened;
+    } catch {
+      const پروکسی_انتخابی = پروکسی_سفارشی || آی_پی_های_پروکسی[Math.floor(Math.random() * آی_پی_های_پروکسی.length)] || "proxyip.cmliussss.net";
+      const [آدرس_آی_پی_پروکسی, پورت_آی_پی_پروکسی = پورت_مقصد] = پروکسی_انتخابی.split(":");
+      رابط_تی‌سی‌پی = connect({ hostname: آدرس_آی_پی_پروکسی, port: Number(پورت_آی_پی_پروکسی) });
+      await رابط_تی‌سی‌پی.opened;
+    }
+
+    ایجاد_خط_انتقال(نوشتن_داده_اولیه);
+  }
+
+  function بررسی_کلید_ویلس(arr, offset = 0) {
+    const uuid = (فرمت_کلید[arr[offset + 0]] + فرمت_کلید[arr[offset + 1]] + فرمت_کلید[arr[offset + 2]] + فرمت_کلید[arr[offset + 3]] + "-" + فرمت_کلید[arr[offset + 4]] + فرمت_کلید[arr[offset + 5]] + "-" + فرمت_کلید[arr[offset + 6]] + فرمت_کلید[arr[offset + 7]] + "-" + فرمت_کلید[arr[offset + 8]] + فرمت_کلید[arr[offset + 9]] + "-" + فرمت_کلید[arr[offset + 10]] + فرمت_کلید[arr[offset + 11]] + فرمت_کلید[arr[offset + 12]] + فرمت_کلید[arr[offset + 13]] + فرمت_کلید[arr[offset + 14]] + فرمت_کلید[arr[offset + 15]]).toLowerCase();
+    return uuid;
+  }
+
+  async function ایجاد_خط_انتقال(نوشتن_داده_اولیه) {
+    داده_انتقالی = رابط_تی‌سی‌پی.writable.getWriter();
+
+    if (نوشتن_داده_اولیه?.byteLength > 0) {
+      await داده_انتقالی.write(نوشتن_داده_اولیه);
+    }
+
+    رابط_تی‌سی‌پی.readable.pipeTo(
+      new WritableStream({
+        write(chunk) {
+          رابط_وب_سوکت.send(chunk);
+        },
+      })
+    );
+  }
+}
+
+function ایجاد_شناسه() {
+  const بیست_کاراکتر = Array.from(new TextEncoder().encode(مسیر_اشتراک))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 20)
+    .padEnd(20, "0");
+
+  const هشت_کاراکتر_اول = بیست_کاراکتر.slice(0, 8);
+  const دوازده_کاراکتر_آخر = بیست_کاراکتر.slice(-12);
+
+  return `${هشت_کاراکتر_اول}-0000-4000-8000-${دوازده_کاراکتر_آخر}`;
+}
+
+function تفکیک_ارایه(ورودی) {
+  if (Array.isArray(ورودی)) return ورودی;
+  if (typeof ورودی === "string") {
+    return ورودی.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
