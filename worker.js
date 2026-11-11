@@ -1,10 +1,11 @@
 import { connect } from 'cloudflare:sockets';
 
 const PAGE = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome to nginx!</title><style>html{color-scheme:light}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;background:#fff;color:#000}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p><p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br>Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p><p><em>Thank you for using nginx.</em></p></body></html>';
+const DEFAULT_PROXY = 'proxyip.cmliussss.net';
 const DNS_HOST = '8.8.4.4';
 const DIAL_TIMEOUT = 3000;
 const MAX_QUEUE = 8 << 20;
-const MAX_REPLAY = 64 << 10;
+const READY = new Uint8Array([0, 0]);
 
 let rawId;
 let idBytes;
@@ -19,7 +20,7 @@ function getId(raw) {
 }
 
 function parseProxy(v) {
-  const m = typeof v === 'string' && /^(?:\[([^\]]+)\]|([^:\s]+))(?::(\d+))?$/.exec(v.trim());
+  const m = typeof v === 'string' && v.trim() !== '0' && /^(?:\[([^\]]+)\]|([^:\s]+))(?::(\d+))?$/.exec(v.trim());
   return m ? { hostname: m[1] || m[2], port: +m[3] || 0 } : null;
 }
 
@@ -29,7 +30,6 @@ function parseHeader(b, id) {
   let o = 18 + b[17];
   if (o + 4 > b.length) return null;
   const cmd = b[o];
-  if (cmd !== 1 && cmd !== 2) return null;
   const port = (b[o + 1] << 8) | b[o + 2];
   const type = b[o + 3];
   o += 4;
@@ -53,8 +53,8 @@ function parseHeader(b, id) {
   } else {
     return null;
   }
-  if (cmd === 2) return port === 53 ? { ver: b[0], host: DNS_HOST, port: 53, offset: o } : null;
-  return { ver: b[0], host, port, offset: o };
+  if (cmd === 1) return { host, port, offset: o };
+  return cmd === 2 && port === 53 ? { host: DNS_HOST, port, offset: o } : null;
 }
 
 function decodeEarly(p, id) {
@@ -90,10 +90,8 @@ async function dial(hostname, port) {
 }
 
 function tunnel(ws, id, proxy, early) {
-  let sock, writer, head, target;
-  let sent = proxy ? [] : null;
-  let sentBytes = 0, got = false, retried = false, redialing = false;
-  let done = false, queued = 0, chain = Promise.resolve();
+  let sock, writer;
+  let target = '-', got = false, done = false, queued = 0, chain = Promise.resolve();
 
   const shut = () => {
     if (done) return;
@@ -103,78 +101,33 @@ function tunnel(ws, id, proxy, early) {
   };
 
   const fail = (e) => {
-    console.log(target ? target.host + ':' + target.port : '-', (e && e.message) || e);
+    console.log(target, (e && e.message) || e);
     shut();
   };
 
   const pump = async (s) => {
     const reader = s.readable.getReader();
-    let first = head;
     try {
       for (;;) {
         const { done: end, value } = await reader.read();
-        if (end || done || s !== sock) break;
-        if (!value.length) continue;
+        if (end || done) break;
         got = true;
-        sent = null;
-        if (first) {
-          const m = new Uint8Array(2 + value.length);
-          m.set(first);
-          m.set(value, 2);
-          ws.send(m);
-          first = null;
-        } else {
-          ws.send(value);
-        }
+        ws.send(value);
       }
     } catch {}
-    if (done || s !== sock) return;
-    if (!got && sent && proxy && !retried) {
-      retried = true;
-      try { await redial(); return; } catch {}
-    }
-    if (!got) console.log(target.host + ':' + target.port, 'closed without data');
+    if (!got) console.log(target, 'closed without data');
     shut();
-  };
-
-  const redial = async () => {
-    redialing = true;
-    const s = await dial(proxy.hostname, proxy.port || target.port);
-    try {
-      const w = s.writable.getWriter();
-      for (let i = 0; sent && i < sent.length; i++) await w.write(sent[i]);
-      if (!sent || done) throw new Error('replay aborted');
-      kill(sock);
-      sock = s;
-      writer = w;
-      redialing = false;
-      pump(s).catch(fail);
-    } catch (e) {
-      kill(s);
-      throw e;
-    }
-  };
-
-  const write = async (bytes) => {
-    if (sent) {
-      sent.push(bytes);
-      sentBytes += bytes.length;
-      if (sentBytes > MAX_REPLAY) sent = null;
-    }
-    if (!redialing) await writer.write(bytes);
   };
 
   const open = async (bytes) => {
     const h = parseHeader(bytes, id);
     if (!h) throw new Error('bad header');
-    target = h;
-    head = new Uint8Array([h.ver, 0]);
+    target = h.host + ':' + h.port;
     let s;
     try {
       s = await dial(h.host, h.port);
     } catch (e) {
       if (!proxy) throw e;
-      retried = true;
       s = await dial(proxy.hostname, proxy.port || h.port);
     }
     if (done) return kill(s);
@@ -182,7 +135,7 @@ function tunnel(ws, id, proxy, early) {
     writer = s.writable.getWriter();
     pump(s).catch(fail);
     const first = bytes.subarray(h.offset);
-    if (first.length) await write(first);
+    if (first.length) await writer.write(first);
   };
 
   const push = (d) => {
@@ -192,8 +145,8 @@ function tunnel(ws, id, proxy, early) {
     chain = chain.then(async () => {
       queued -= size;
       if (done) return;
-      const bytes = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(await d.arrayBuffer());
-      if (writer) await write(bytes);
+      const bytes = new Uint8Array(d instanceof ArrayBuffer ? d : await d.arrayBuffer());
+      if (writer) await writer.write(bytes);
       else await open(bytes);
     }).catch(fail);
   };
@@ -209,20 +162,18 @@ function tunnel(ws, id, proxy, early) {
 
 export default {
   async fetch(req, env) {
-    const { pathname } = new URL(req.url);
-    if (pathname === '/') {
-      if (req.method !== 'GET' && req.method !== 'HEAD') return new Response(null, { status: 405, headers: { allow: 'GET, HEAD' } });
-      return new Response(req.method === 'HEAD' ? null : PAGE, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    if ((req.headers.get('upgrade') || '').toLowerCase() === 'websocket') {
+      const id = getId(env.UUID);
+      if (!id) return new Response('Server Error', { status: 500 });
+      const [client, server] = Object.values(new WebSocketPair());
+      server.binaryType = 'arraybuffer';
+      server.accept();
+      server.send(READY);
+      tunnel(server, id, parseProxy(env.PROXYIP ?? DEFAULT_PROXY), decodeEarly(req.headers.get('sec-websocket-protocol'), id));
+      return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
     }
-    if (pathname !== '/ws') return new Response('Not Found', { status: 404 });
-    if (req.method !== 'GET') return new Response(null, { status: 405, headers: { allow: 'GET' } });
-    if ((req.headers.get('upgrade') || '').toLowerCase() !== 'websocket') return new Response('Upgrade Required', { status: 426 });
-    const id = getId(env.UUID);
-    if (!id) return new Response('Server Error', { status: 500 });
-    const [client, server] = Object.values(new WebSocketPair());
-    server.binaryType = 'arraybuffer';
-    server.accept();
-    tunnel(server, id, parseProxy(env.PROXYIP), decodeEarly(req.headers.get('sec-websocket-protocol'), id));
-    return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
+    if (new URL(req.url).pathname !== '/') return new Response('Not Found', { status: 404 });
+    if (req.method !== 'GET' && req.method !== 'HEAD') return new Response(null, { status: 405, headers: { allow: 'GET, HEAD' } });
+    return new Response(req.method === 'HEAD' ? null : PAGE, { headers: { 'content-type': 'text/html; charset=utf-8' } });
   },
 };
