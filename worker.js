@@ -1,6 +1,7 @@
 import { connect } from 'cloudflare:sockets';
 
 const PAGE = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome to nginx!</title><style>html{color-scheme:light}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;background:#fff;color:#000}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p><p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br>Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p><p><em>Thank you for using nginx.</em></p></body></html>';
+const DNS_HOST = '8.8.4.4';
 const DIAL_TIMEOUT = 3000;
 const MAX_QUEUE = 8 << 20;
 const MAX_REPLAY = 64 << 10;
@@ -26,7 +27,9 @@ function parseHeader(b, id) {
   if (b.length < 22) return null;
   for (let i = 0; i < 16; i++) if (b[1 + i] !== id[i]) return null;
   let o = 18 + b[17];
-  if (o + 4 > b.length || b[o] !== 1) return null;
+  if (o + 4 > b.length) return null;
+  const cmd = b[o];
+  if (cmd !== 1 && cmd !== 2) return null;
   const port = (b[o + 1] << 8) | b[o + 2];
   const type = b[o + 3];
   o += 4;
@@ -50,6 +53,7 @@ function parseHeader(b, id) {
   } else {
     return null;
   }
+  if (cmd === 2) return port === 53 ? { ver: b[0], host: DNS_HOST, port: 53, offset: o } : null;
   return { ver: b[0], host, port, offset: o };
 }
 
@@ -98,6 +102,11 @@ function tunnel(ws, id, proxy, early) {
     try { ws.close(1000); } catch {}
   };
 
+  const fail = (e) => {
+    console.log(target ? target.host + ':' + target.port : '-', (e && e.message) || e);
+    shut();
+  };
+
   const pump = async (s) => {
     const reader = s.readable.getReader();
     let first = head;
@@ -124,6 +133,7 @@ function tunnel(ws, id, proxy, early) {
       retried = true;
       try { await redial(); return; } catch {}
     }
+    if (!got) console.log(target.host + ':' + target.port, 'closed without data');
     shut();
   };
 
@@ -138,7 +148,7 @@ function tunnel(ws, id, proxy, early) {
       sock = s;
       writer = w;
       redialing = false;
-      pump(s).catch(shut);
+      pump(s).catch(fail);
     } catch (e) {
       kill(s);
       throw e;
@@ -170,7 +180,7 @@ function tunnel(ws, id, proxy, early) {
     if (done) return kill(s);
     sock = s;
     writer = s.writable.getWriter();
-    pump(s).catch(shut);
+    pump(s).catch(fail);
     const first = bytes.subarray(h.offset);
     if (first.length) await write(first);
   };
@@ -185,14 +195,14 @@ function tunnel(ws, id, proxy, early) {
       const bytes = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(await d.arrayBuffer());
       if (writer) await write(bytes);
       else await open(bytes);
-    }).catch(shut);
+    }).catch(fail);
   };
 
   ws.addEventListener('message', (e) => {
     if (typeof e.data === 'string') shut();
     else push(e.data);
   });
-  ws.addEventListener('close', shut);
+  ws.addEventListener('close', () => { chain = chain.then(shut); });
   ws.addEventListener('error', shut);
   if (early) push(early.buffer);
 }
