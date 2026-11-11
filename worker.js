@@ -3,17 +3,16 @@ import { connect } from "cloudflare:sockets";
 const WS_PATH = "/vless-ws";
 const PROXY_IP = "proxyip.cmliussss.net";
 
-const RAW_HEX = "d342d11ed4244583b36e524ab1f0afa4";
-const UUID_HI = BigInt("0x" + RAW_HEX.slice(0, 16));
-const UUID_LO = BigInt("0x" + RAW_HEX.slice(16, 32));
+const UUID_HI = 0xd342d11ed4244583n;
+const UUID_LO = 0xb36e524ab1f0afa4n;
 
-const NGINX_PAGE = `<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>html{color-scheme:light dark}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working.</p></body></html>`;
+const NGINX_HTML = `<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>html{color-scheme:light dark}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working.</p></body></html>`;
 
 export default {
   async fetch(req) {
     if (req.headers.get("Upgrade") !== "websocket") {
       const { pathname } = new URL(req.url);
-      return new Response(NGINX_PAGE, {
+      return new Response(NGINX_HTML, {
         status: pathname === "/" ? 200 : 404,
         headers: { "Content-Type": "text/html; charset=UTF-8" }
       });
@@ -27,12 +26,12 @@ export default {
     server.binaryType = "arraybuffer";
     server.send(new Uint8Array([0, 0]));
 
-    fastPipe(server, url.searchParams.get("proxyip"));
+    handleTraffic(server, url.searchParams.get("proxyip"));
     return new Response(null, { status: 101, webSocket: client });
   }
 };
 
-function fastPipe(ws, proxy) {
+function handleTraffic(ws, customProxy) {
   let tcp, writer;
 
   ws.addEventListener("message", async ({ data }) => {
@@ -68,21 +67,21 @@ function fastPipe(ws, proxy) {
       return ws.close();
     }
 
-    const connectDirect = async () => {
-      const s = connect({ hostname: host, port });
+    const dial = async (h, p) => {
+      const s = connect({ hostname: h, port: p });
       await s.opened;
       return s;
     };
 
-    const timeout = new Promise((_, reject) => setTimeout(reject, 1200));
-
     try {
-      tcp = await Promise.race([connectDirect(), timeout]);
+      tcp = await Promise.race([
+        dial(host, port),
+        new Promise((_, r) => setTimeout(r, 1000))
+      ]);
     } catch {
-      const [pHost, pPort = port] = (proxy || PROXY_IP).split(":");
+      const [pHost, pPort = port] = (customProxy || PROXY_IP).split(":");
       try {
-        tcp = connect({ hostname: pHost, port: +pPort });
-        await tcp.opened;
+        tcp = await dial(pHost, +pPort);
       } catch {
         return ws.close();
       }
