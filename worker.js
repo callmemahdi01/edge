@@ -1,211 +1,227 @@
 import { connect } from "cloudflare:sockets";
 
-const شناسه_تایید = "7b102311-43fd-4e8f-877e-8090623c101d";
-const مسیر_مجاز = "/go.html";
-
-const آی_پی_های_پروکسی = [
-  "104.16.1.1:443",
-  "104.17.1.1:443",
-  "proxyip.cmliussss.net:443"
-];
-
-const فرمت_کلید = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
-
-const صفحه_اصلی_انجین‌ایکس = `<!DOCTYPE html>
+const NGINX_HTML = `<!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8">
 <title>Welcome to nginx!</title>
 <style>
-body {
-    background-color: #ffffff;
-    color: #000000;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    height: 100vh;
-    margin: 0;
-}
-.box {
-    border: 1px solid #cccccc;
-    padding: 30px 40px;
-    max-width: 550px;
-    text-align: center;
-}
-h1 {
-    font-size: 22px;
-    margin: 0 0 16px 0;
-}
-p {
-    font-size: 14px;
-    line-height: 1.6;
-    margin: 0 0 12px 0;
-}
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
 </style>
 </head>
 <body>
-<div class="box">
-    <h1>Welcome to nginx!</h1>
-    <p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
-    <p><em>Thank you for using nginx.</em></p>
-</div>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+<p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p>
+<p><em>Thank you for using nginx.</em></p>
 </body>
 </html>`;
 
-export default {
-  async fetch(درخواست, env) {
-    const url = new URL(درخواست.url);
-    const هدر_ارتقا = درخواست.headers.get("Upgrade") || "";
-    const درخواست_وب_سوکت = هدر_ارتقا.toLowerCase() === "websocket";
+function decodeBase64Url(str) {
+  try {
+    const b64 = str.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), "=");
+    const bin = atob(pad);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  } catch {
+    return null;
+  }
+}
 
-    if (!درخواست_وب_سوکت) {
-      return new Response(صفحه_اصلی_انجین‌ایکس, {
-        status: 200,
-        headers: { "Content-Type": "text/html;charset=utf-8" },
+function getHeaderLength(b) {
+  if (b.length < 18) return -1;
+  const m = b[17];
+  const optOffset = 18 + m;
+  if (b.length < optOffset + 4) return -1;
+  const addrType = b[optOffset + 3];
+  let addrLen = 0;
+  if (addrType === 1) addrLen = 4;
+  else if (addrType === 2) {
+    if (b.length < optOffset + 5) return -1;
+    addrLen = 1 + b[optOffset + 4];
+  } else if (addrType === 3) addrLen = 16;
+  else return -2;
+  const total = optOffset + 4 + addrLen;
+  return b.length >= total ? total : -1;
+}
+
+async function handleSession(server, earlyData, env) {
+  let socket = null;
+  try {
+    const wsStream = new ReadableStream({
+      start(controller) {
+        server.addEventListener("message", (e) => {
+          controller.enqueue(e.data);
+        });
+        server.addEventListener("close", () => {
+          try { controller.close(); } catch {}
+        });
+        server.addEventListener("error", (err) => {
+          try { controller.error(err); } catch {}
+        });
+        if (earlyData) {
+          controller.enqueue(earlyData);
+        }
+      },
+      cancel() {
+        try { server.close(); } catch {}
+      }
+    });
+
+    const reader = wsStream.getReader();
+    let buf = new Uint8Array(0);
+    let headerLen = -1;
+
+    while (headerLen < 0) {
+      const { value, done } = await reader.read();
+      if (done) {
+        server.close(1002);
+        return;
+      }
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      if (buf.length === 0) {
+        buf = chunk;
+      } else {
+        const temp = new Uint8Array(buf.length + chunk.length);
+        temp.set(buf, 0);
+        temp.set(chunk, buf.length);
+        buf = temp;
+      }
+      headerLen = getHeaderLength(buf);
+      if (headerLen === -2) {
+        server.close(1003);
+        return;
+      }
+    }
+
+    const expectedUuid = (env.UUID || "").replace(/-/g, "").toLowerCase();
+    let uuidHex = "";
+    for (let i = 1; i <= 16; i++) {
+      uuidHex += (buf[i] < 16 ? "0" : "") + buf[i].toString(16);
+    }
+    if (!expectedUuid || uuidHex !== expectedUuid) {
+      server.close(1008);
+      return;
+    }
+
+    const optOffset = 18 + buf[17];
+    const cmd = buf[optOffset];
+    if (cmd !== 1) {
+      server.close(1003);
+      return;
+    }
+
+    const port = (buf[optOffset + 1] << 8) | buf[optOffset + 2];
+    const addrType = buf[optOffset + 3];
+    let address = "";
+
+    if (addrType === 1) {
+      const o = optOffset + 4;
+      address = `${buf[o]}.${buf[o + 1]}.${buf[o + 2]}.${buf[o + 3]}`;
+    } else if (addrType === 2) {
+      const l = buf[optOffset + 4];
+      const o = optOffset + 5;
+      address = new TextDecoder().decode(buf.subarray(o, o + l));
+    } else if (addrType === 3) {
+      const o = optOffset + 4;
+      const parts = [];
+      for (let i = 0; i < 8; i++) {
+        const idx = o + i * 2;
+        parts.push(((buf[idx] << 8) | buf[idx + 1]).toString(16));
+      }
+      address = parts.join(":");
+    }
+
+    const initialPayload = buf.subarray(headerLen);
+
+    try {
+      socket = connect({ hostname: address, port });
+      await socket.opened;
+    } catch {
+      server.close(1011);
+      return;
+    }
+
+    const writer = socket.writable.getWriter();
+    if (initialPayload.length > 0) {
+      await writer.write(initialPayload);
+    }
+
+    const upstream = async () => {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          await writer.write(value instanceof Uint8Array ? value : new Uint8Array(value));
+        }
+      } catch {}
+      try { await writer.close(); } catch {}
+    };
+
+    const downstream = async () => {
+      let hasSentHeader = false;
+      try {
+        await socket.readable.pipeTo(
+          new WritableStream({
+            write(chunk) {
+              if (!hasSentHeader) {
+                hasSentHeader = true;
+                const resp = new Uint8Array(2 + chunk.length);
+                resp.set(chunk, 2);
+                server.send(resp);
+              } else {
+                server.send(chunk);
+              }
+            },
+          })
+        );
+        if (!hasSentHeader) {
+          server.send(new Uint8Array([0, 0]));
+        }
+      } catch {}
+      try { server.close(); } catch {}
+    };
+
+    await Promise.all([upstream(), downstream()]);
+  } finally {
+    try { socket?.close(); } catch {}
+    try { server.close(); } catch {}
+  }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === "/") {
+      return new Response(NGINX_HTML, {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     }
 
-    const پروکسی_سفارشی = url.searchParams.get("proxyip");
-    const [کلاینت, رابط_وب_سوکت] = Object.values(new WebSocketPair());
-    رابط_وب_سوکت.accept();
-    رابط_وب_سوکت.binaryType = "arraybuffer";
+    if (url.pathname !== "/ws" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response(null, { status: 404 });
+    }
 
-    راه‌اندازی_خط_لوله(رابط_وب_سوکت, پروکسی_سفارشی);
-    return new Response(null, { status: 101, webSocket: کلاینت });
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+
+    const protocol = request.headers.get("Sec-WebSocket-Protocol");
+    const earlyData = protocol ? decodeBase64Url(protocol) : null;
+    const responseHeaders = protocol ? { "Sec-WebSocket-Protocol": protocol } : undefined;
+
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(handleSession(server, earlyData, env));
+    } else {
+      handleSession(server, earlyData, env);
+    }
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: responseHeaders,
+    });
   },
 };
-
-async function راه‌اندازی_خط_لوله(رابط_وب_سوکت, پروکسی_سفارشی) {
-  let رابط_تی‌سی‌پی;
-  let داده_اولیه = true;
-  let صف_پردازش = Promise.resolve();
-  let داده_انتقالی;
-
-  رابط_وب_سوکت.addEventListener("message", (event) => {
-    صف_پردازش = صف_پردازش.then(async () => {
-      try {
-        if (داده_اولیه) {
-          داده_اولیه = false;
-          await تجزیه_هدر_ویلس(event.data);
-        } else {
-          if (داده_انتقالی) {
-            await داده_انتقالی.write(event.data);
-          }
-        }
-      } catch (err) {
-        رابط_وب_سوکت.close();
-      }
-    });
-  });
-
-  رابط_وب_سوکت.addEventListener("close", () => {
-    if (رابط_تی‌سی‌پی) {
-      try { رابط_تی‌سی‌پی.close(); } catch {}
-    }
-  });
-
-  رابط_وب_سوکت.addEventListener("error", () => {
-    if (رابط_تی‌سی‌پی) {
-      try { رابط_تی‌سی‌پی.close(); } catch {}
-    }
-  });
-
-  async function تجزیه_هدر_ویلس(داده_ویلس) {
-    if (داده_ویلس.byteLength < 18) {
-      رابط_وب_سوکت.close();
-      return;
-    }
-
-    if (بررسی_کلید_ویلس(new Uint8Array(داده_ویلس.slice(1, 17))) !== شناسه_تایید) {
-      رابط_وب_سوکت.close();
-      return;
-    }
-
-    const موقعیت_داده = new Uint8Array(داده_ویلس)[17];
-    const شاخص_پورت = 18 + موقعیت_داده + 1;
-    const بافر_پورت = داده_ویلس.slice(شاخص_پورت, شاخص_پورت + 2);
-    const پورت_مقصد = new DataView(بافر_پورت).getUint16(0);
-
-    const شاخص_آدرس = شاخص_پورت + 2;
-    const بافر_آدرس = new Uint8Array(داده_ویلس.slice(شاخص_آدرس, شاخص_آدرس + 1));
-    const نوع_آدرس = بافر_آدرس[0];
-
-    let طول_آدرس = 0;
-    let آدرس_مقصد = "";
-    let شاخص_اطلاعات_آدرس = شاخص_آدرس + 1;
-
-    switch (نوع_آدرس) {
-      case 1:
-        طول_آدرس = 4;
-        آدرس_مقصد = new Uint8Array(داده_ویلس.slice(شاخص_اطلاعات_آدرس, شاخص_اطلاعات_آدرس + طول_آدرس)).join(".");
-        break;
-      case 2:
-        طول_آدرس = new Uint8Array(داده_ویلس.slice(شاخص_اطلاعات_آدرس, شاخص_اطلاعات_آدرس + 1))[0];
-        شاخص_اطلاعات_آدرس += 1;
-        آدرس_مقصد = new TextDecoder().decode(داده_ویلس.slice(شاخص_اطلاعات_آدرس, شاخص_اطلاعات_آدرس + طول_آدرس));
-        break;
-      case 3:
-        طول_آدرس = 16;
-        const dataView = new DataView(داده_ویلس.slice(شاخص_اطلاعات_آدرس, شاخص_اطلاعات_آدرس + طول_آدرس));
-        const ipv6 = [];
-        for (let i = 0; i < 8; i++) {
-          ipv6.push(dataView.getUint16(i * 2).toString(16));
-        }
-        آدرس_مقصد = ipv6.join(":");
-        break;
-      default:
-        رابط_وب_سوکت.close();
-        return;
-    }
-
-    const نوشتن_داده_اولیه = داده_ویلس.slice(شاخص_اطلاعات_آدرس + طول_آدرس);
-
-    try {
-      رابط_تی‌سی‌پی = connect({ hostname: آدرس_مقصد, port: پورت_مقصد });
-      await رابط_تی‌سی‌پی.opened;
-    } catch {
-      const پروکسی_انتخابی = پروکسی_سفارشی || آی_پی_های_پروکسی[Math.floor(Math.random() * آی_پی_های_پروکسی.length)];
-      const [آدرس_آی_پی_پروکسی, پورت_آی_پی_پروکسی = پورت_مقصد] = پروکسی_انتخابی.split(":");
-      رابط_تی‌سی‌پی = connect({ hostname: آدرس_آی_پی_پروکسی, port: Number(پورت_آی_پی_پروکسی) });
-      await رابط_تی‌سی‌پی.opened;
-    }
-
-    رابط_وب_سوکت.send(new Uint8Array([0, 0]));
-    ایجاد_خط_انتقال(نوشتن_داده_اولیه);
-  }
-
-  function بررسی_کلید_ویلس(arr, offset = 0) {
-    return (
-      فرمت_کلید[arr[offset + 0]] + فرمت_کلید[arr[offset + 1]] + فرمت_کلید[arr[offset + 2]] + فرمت_کلید[arr[offset + 3]] + "-" +
-      فرمت_کلید[arr[offset + 4]] + فرمت_کلید[arr[offset + 5]] + "-" +
-      فرمت_کلید[arr[offset + 6]] + فرمت_کلید[arr[offset + 7]] + "-" +
-      فرمت_کلید[arr[offset + 8]] + فرمت_کلید[arr[offset + 9]] + "-" +
-      فرمت_کلید[arr[offset + 10]] + فرمت_کلید[arr[offset + 11]] + فرمت_کلید[arr[offset + 12]] + فرمت_کلید[arr[offset + 13]] + فرمت_کلید[arr[offset + 14]] + فرمت_کلید[arr[offset + 15]]
-    ).toLowerCase();
-  }
-
-  async function ایجاد_خط_انتقال(نوشتن_داده_اولیه) {
-    داده_انتقالی = رابط_تی‌سی‌پی.writable.getWriter();
-
-    if (نوشتن_داده_اولیه?.byteLength > 0) {
-      await داده_انتقالی.write(نوشتن_داده_اولیه);
-    }
-
-    رابط_تی‌سی‌پی.readable.pipeTo(
-      new WritableStream({
-        write(chunk) {
-          try {
-            رابط_وب_سوکت.send(chunk);
-          } catch {}
-        },
-        close() {
-          try { رابط_وب_سوکت.close(); } catch {}
-        },
-        abort() {
-          try { رابط_وب_سوکت.close(); } catch {}
-        }
-      })
-    ).catch(() => {});
-  }
-}
