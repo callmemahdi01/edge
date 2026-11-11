@@ -6,20 +6,59 @@ const PROXY_IP = "proxyip.cmliussss.net";
 const UUID_HI = 0xd342d11ed4244583n;
 const UUID_LO = 0xb36e524ab1f0afa4n;
 
-const NGINX_HTML = `<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>html{color-scheme:light dark}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working.</p></body></html>`;
+const NGINX_PAGE = `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>`;
+
+const NGINX_404 = `<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>`;
 
 export default {
   async fetch(req) {
     if (req.headers.get("Upgrade") !== "websocket") {
       const { pathname } = new URL(req.url);
-      return new Response(NGINX_HTML, {
-        status: pathname === "/" ? 200 : 404,
-        headers: { "Content-Type": "text/html; charset=UTF-8" }
+      const isRoot = pathname === "/" || pathname === "/index.html";
+      return new Response(isRoot ? NGINX_PAGE : NGINX_404, {
+        status: isRoot ? 200 : 404,
+        headers: {
+          "Content-Type": "text/html",
+          "Server": "nginx"
+        }
       });
     }
 
     const url = new URL(req.url);
-    if (url.pathname !== WS_PATH) return new Response(null, { status: 404 });
+    if (url.pathname !== WS_PATH) {
+      return new Response(NGINX_404, {
+        status: 404,
+        headers: { "Content-Type": "text/html", "Server": "nginx" }
+      });
+    }
 
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
