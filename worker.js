@@ -4,6 +4,7 @@ const WS_PATH = "/home/go.html";
 const PROXY_IP = "proxyip.cmliussss.net";
 const CONNECT_TIMEOUT = 1000;
 const FALLBACK_TIMEOUT = 5000;
+const READ_BUFFER_SIZE = 65536;
 
 const U0 = 0xd342d11e;
 const U1 = 0xd4244583;
@@ -50,13 +51,18 @@ export default {
   fetch(req) {
     const url = new URL(req.url);
 
-    if (url.pathname === WS_PATH && req.headers.get("Upgrade") === "websocket") {
+    if (url.pathname === WS_PATH && req.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      const protocol = req.headers.get("Sec-WebSocket-Protocol");
       const { 0: client, 1: server } = new WebSocketPair();
       server.accept();
       server.binaryType = "arraybuffer";
       server.send(RESPONSE_HEADER);
-      handleTraffic(server, url.searchParams.get("proxyip"));
-      return new Response(null, { status: 101, webSocket: client });
+      handleTraffic(server, url.searchParams.get("proxyip"), protocol && decodeEarly(protocol));
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+        headers: protocol ? { "Sec-WebSocket-Protocol": protocol } : undefined
+      });
     }
 
     return url.pathname === "/"
@@ -64,6 +70,18 @@ export default {
       : new Response(NGINX_404, { status: 404, headers: HTML_HEADERS });
   }
 };
+
+function decodeEarly(value) {
+  try {
+    const bin = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
+    if (bin.length < 18) return null;
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < out.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  } catch {
+    return null;
+  }
+}
 
 async function dial(hostname, port, ms) {
   const socket = connect({ hostname, port });
@@ -84,10 +102,10 @@ async function dial(hostname, port, ms) {
   }
 }
 
-function handleTraffic(ws, customProxy) {
+function handleTraffic(ws, customProxy, early) {
   let tcp;
   let writer;
-  let started = false;
+  let started = !!early;
   const queue = [];
 
   const close = () => {
@@ -154,12 +172,14 @@ function handleTraffic(ws, customProxy) {
     for (const chunk of queue) writer.write(chunk).catch(close);
     queue.length = 0;
 
-    const reader = tcp.readable.getReader();
+    const reader = tcp.readable.getReader({ mode: "byob" });
+    let buffer = new ArrayBuffer(READ_BUFFER_SIZE);
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await reader.read(new Uint8Array(buffer));
         if (done || ws.readyState !== 1) break;
         ws.send(value);
+        buffer = value.buffer;
       }
     } catch {}
     close();
@@ -176,4 +196,6 @@ function handleTraffic(ws, customProxy) {
 
   ws.addEventListener("close", close);
   ws.addEventListener("error", close);
+
+  if (early) start(early).catch(close);
 }
