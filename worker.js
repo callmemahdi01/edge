@@ -2,9 +2,17 @@ import { connect } from "cloudflare:sockets";
 
 const WS_PATH = "/home/go.html";
 const PROXY_IP = "proxyip.cmliussss.net";
+const CONNECT_TIMEOUT = 1000;
+const FALLBACK_TIMEOUT = 5000;
 
-const UUID_HI = 0xd342d11ed4244583n;
-const UUID_LO = 0xb36e524ab1f0afa4n;
+const U0 = 0xd342d11e;
+const U1 = 0xd4244583;
+const U2 = 0xb36e524a;
+const U3 = 0xb1f0afa4;
+
+const RESPONSE_HEADER = new Uint8Array(2);
+const HTML_HEADERS = { "Content-Type": "text/html", Server: "nginx" };
+const decoder = new TextDecoder();
 
 const NGINX_PAGE = `<!DOCTYPE html>
 <html>
@@ -39,108 +47,133 @@ const NGINX_404 = `<html>
 </html>\r\n`;
 
 export default {
-  async fetch(req) {
+  fetch(req) {
     const url = new URL(req.url);
-    const isWs = req.headers.get("Upgrade") === "websocket";
 
-    if (isWs && url.pathname === WS_PATH) {
-      const [client, server] = Object.values(new WebSocketPair());
+    if (url.pathname === WS_PATH && req.headers.get("Upgrade") === "websocket") {
+      const { 0: client, 1: server } = new WebSocketPair();
       server.accept();
       server.binaryType = "arraybuffer";
-      server.send(new Uint8Array([0, 0]));
-
+      server.send(RESPONSE_HEADER);
       handleTraffic(server, url.searchParams.get("proxyip"));
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    if (url.pathname === "/") {
-      return new Response(NGINX_PAGE, {
-        status: 200,
-        headers: {
-          "Content-Type": "text/html",
-          "Server": "nginx"
-        }
-      });
-    }
-
-    return new Response(NGINX_404, {
-      status: 404,
-      headers: {
-        "Content-Type": "text/html",
-        "Server": "nginx"
-      }
-    });
+    return url.pathname === "/"
+      ? new Response(NGINX_PAGE, { headers: HTML_HEADERS })
+      : new Response(NGINX_404, { status: 404, headers: HTML_HEADERS });
   }
 };
 
+async function dial(hostname, port, ms) {
+  const socket = connect({ hostname, port });
+  let timer;
+  try {
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => {
+        timer = setTimeout(reject, ms);
+      })
+    ]);
+    return socket;
+  } catch (error) {
+    socket.close().catch(() => {});
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function handleTraffic(ws, customProxy) {
-  let tcp, writer;
+  let tcp;
+  let writer;
+  let started = false;
+  const queue = [];
 
-  ws.addEventListener("message", async ({ data }) => {
-    if (writer) {
-      await writer.write(data);
-      return;
-    }
+  const close = () => {
+    try {
+      ws.close();
+    } catch {}
+    tcp?.close().catch(() => {});
+  };
 
-    if (data.byteLength < 18) return ws.close();
-
-    const view = new DataView(data);
-    if (view.getBigUint64(1) !== UUID_HI || view.getBigUint64(9) !== UUID_LO) {
-      return ws.close();
-    }
-
-    const u8 = new Uint8Array(data);
-    const pIdx = 19 + u8[17];
-    const port = view.getUint16(pIdx);
-    const type = u8[pIdx + 2];
-    let offset = pIdx + 3;
-    let host = "";
-
-    if (type === 1) {
-      host = `${u8[offset++]}.${u8[offset++]}.${u8[offset++]}.${u8[offset++]}`;
-    } else if (type === 2) {
-      const len = u8[offset++];
-      host = String.fromCharCode(...u8.subarray(offset, (offset += len)));
-    } else if (type === 3) {
-      const parts = [];
-      for (let i = 0; i < 8; i++, offset += 2) parts.push(view.getUint16(offset).toString(16));
-      host = parts.join(":");
-    } else {
-      return ws.close();
-    }
-
-    const dial = async (h, p) => {
-      const s = connect({ hostname: h, port: p });
-      await s.opened;
-      return s;
-    };
+  const start = async (data) => {
+    let host;
+    let port;
+    let offset;
 
     try {
-      tcp = await Promise.race([
-        dial(host, port),
-        new Promise((_, r) => setTimeout(r, 1000))
-      ]);
+      const view = new DataView(data);
+      if (
+        view.getUint32(1) !== U0 ||
+        view.getUint32(5) !== U1 ||
+        view.getUint32(9) !== U2 ||
+        view.getUint32(13) !== U3
+      ) {
+        return close();
+      }
+
+      const pIdx = 19 + view.getUint8(17);
+      port = view.getUint16(pIdx);
+      const type = view.getUint8(pIdx + 2);
+      offset = pIdx + 3;
+
+      if (type === 1) {
+        host = `${view.getUint8(offset)}.${view.getUint8(offset + 1)}.${view.getUint8(offset + 2)}.${view.getUint8(offset + 3)}`;
+        offset += 4;
+      } else if (type === 2) {
+        const len = view.getUint8(offset++);
+        host = decoder.decode(new Uint8Array(data, offset, len));
+        offset += len;
+      } else if (type === 3) {
+        const parts = new Array(8);
+        for (let i = 0; i < 8; i++, offset += 2) parts[i] = view.getUint16(offset).toString(16);
+        host = parts.join(":");
+      } else {
+        return close();
+      }
     } catch {
-      const [pHost, pPort = port] = (customProxy || PROXY_IP).split(":");
+      return close();
+    }
+
+    try {
+      tcp = await dial(host, port, CONNECT_TIMEOUT);
+    } catch {
+      const [proxyHost, proxyPort] = (customProxy || PROXY_IP).split(":");
       try {
-        tcp = await dial(pHost, +pPort);
+        tcp = await dial(proxyHost, proxyPort ? +proxyPort : port, FALLBACK_TIMEOUT);
       } catch {
-        return ws.close();
+        return close();
       }
     }
 
-    writer = tcp.writable.getWriter();
-    if (offset < u8.byteLength) await writer.write(u8.subarray(offset));
+    if (ws.readyState !== 1) return close();
 
-    tcp.readable.pipeTo(new WritableStream({
-      write(chunk) {
-        if (ws.readyState === 1) ws.send(chunk);
-      },
-      close() { ws.close(); },
-      abort() { ws.close(); }
-    })).catch(() => ws.close());
+    writer = tcp.writable.getWriter();
+    if (offset < data.byteLength) writer.write(new Uint8Array(data, offset)).catch(close);
+    for (const chunk of queue) writer.write(chunk).catch(close);
+    queue.length = 0;
+
+    const reader = tcp.readable.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || ws.readyState !== 1) break;
+        ws.send(value);
+      }
+    } catch {}
+    close();
+  };
+
+  ws.addEventListener("message", ({ data }) => {
+    if (writer) writer.write(data).catch(close);
+    else if (started) queue.push(data);
+    else {
+      started = true;
+      start(data).catch(close);
+    }
   });
 
-  ws.addEventListener("close", () => tcp?.close());
-  ws.addEventListener("error", () => tcp?.close());
+  ws.addEventListener("close", close);
+  ws.addEventListener("error", close);
 }
