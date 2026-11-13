@@ -4,8 +4,18 @@ const WS_PATH = "/home/go.html";
 const PROXY_IP = "proxyip.cmliussss.net";
 const CONNECT_TIMEOUT = 7000;
 const FALLBACK_TIMEOUT = 10000;
-const WS_BUFFER_LIMIT = 1048576; // 1 MB backpressure high watermark
-const WS_BUFFER_RESUME = 262144; // 256 KB resume watermark
+const WINDOW = 2097152;
+const BUDGET = 83886080;
+const QUEUE_LIMIT = 4194304;
+const FLUSH_SIZE = 32768;
+const FLUSH_MS = 2;
+const waiters = new Set();
+let total = 0;
+
+const wakeAll = () => {
+  for (const w of waiters) w();
+  waiters.clear();
+};
 
 const U0 = 0xd342d11e;
 const U1 = 0xd4244583;
@@ -90,7 +100,48 @@ function handleTraffic(ws, customProxy, early) {
   let tcp = null;
   let writer = null;
   let started = !!early;
+  let sent = 0;
+  let acked = 0;
+  let credit = false;
+  let acct = 0;
+  let queued = 0;
+  let buf = [];
+  let len = 0;
+  let timer = 0;
   const queue = [];
+
+  const sync = () => {
+    const d = (credit ? sent - acked : 0) - acct;
+    if (!d) return;
+    acct += d;
+    total += d;
+    if (d < 0) wakeAll();
+  };
+
+  const blocked = () =>
+    ws.readyState === 1 && credit && (sent + len - acked > WINDOW || total > BUDGET);
+
+  const flush = () => {
+    clearTimeout(timer);
+    timer = 0;
+    const parts = buf;
+    const n = len;
+    buf = [];
+    len = 0;
+    if (!n || ws.readyState !== 1) return;
+    let out = parts[0];
+    if (parts.length > 1) {
+      out = new Uint8Array(n);
+      let o = 0;
+      for (const c of parts) {
+        out.set(c, o);
+        o += c.byteLength;
+      }
+    }
+    ws.send(out);
+    sent += n;
+    sync();
+  };
 
   const close = () => {
     try {
@@ -100,6 +151,12 @@ function handleTraffic(ws, customProxy, early) {
       tcp.close().catch(() => {});
       tcp = null;
     }
+    clearTimeout(timer);
+    buf = [];
+    len = 0;
+    credit = false;
+    sync();
+    wakeAll();
   };
 
   const start = async (data) => {
@@ -174,34 +231,44 @@ function handleTraffic(ws, customProxy, early) {
     }
     queue.length = 0;
 
-    // Outbound pipe from TCP upstream to Client WebSocket with flow-control backpressure
     (async () => {
       const reader = tcp.readable.getReader();
       try {
         while (ws.readyState === 1) {
+          while (blocked()) {
+            flush();
+            await new Promise((r) => waiters.add(r));
+          }
           const { done, value } = await reader.read();
           if (done) break;
-          ws.send(value);
-
-          // Flow control: throttle TCP read if client WebSocket buffer is saturated
-          if (typeof ws.bufferedAmount === "number" && ws.bufferedAmount > WS_BUFFER_LIMIT) {
-            while (ws.bufferedAmount > WS_BUFFER_RESUME && ws.readyState === 1) {
-              await new Promise((r) => setTimeout(r, 15));
-            }
-          }
+          buf.push(value);
+          len += value.byteLength;
+          if (len >= FLUSH_SIZE) flush();
+          else if (!timer) timer = setTimeout(flush, FLUSH_MS);
         }
+        flush();
       } catch {}
       close();
     })();
   };
 
   ws.addEventListener("message", ({ data }) => {
-    if (typeof data === "string") return;
+    if (typeof data === "string") {
+      const n = Number(data);
+      if (n >= 0) {
+        credit = true;
+        if (n > acked) acked = n;
+        sync();
+      }
+      return;
+    }
     const chunk = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 
     if (writer) {
       writer.write(chunk).catch(close);
     } else if (started) {
+      queued += chunk.byteLength;
+      if (queued > QUEUE_LIMIT) return close();
       queue.push(chunk);
     } else {
       started = true;
