@@ -4,7 +4,7 @@ const WS_PATH = "/home/go.html";
 const PROXY_IP = "proxyip.cmliussss.net";
 const CONNECT_TIMEOUT = 7000;
 const FALLBACK_TIMEOUT = 10000;
-const WINDOW = 2097152;
+const WINDOW = 4194304; // or const WINDOW = 2097152;
 const BUDGET = 83886080;
 const QUEUE_LIMIT = 4194304;
 const FLUSH_SIZE = 32768;
