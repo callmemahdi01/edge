@@ -111,7 +111,7 @@ function handleTraffic(ws, customProxy, early) {
   const queue = [];
 
   const sync = () => {
-    const d = (credit ? sent - acked : 0) - acct;
+    const d = (credit ? Math.max(0, sent - acked) : 0) - acct;
     if (!d) return;
     acct += d;
     total += d;
@@ -138,7 +138,11 @@ function handleTraffic(ws, customProxy, early) {
         o += c.byteLength;
       }
     }
-    ws.send(out);
+    try {
+      ws.send(out);
+    } catch {
+      return close();
+    }
     sent += n;
     sync();
   };
