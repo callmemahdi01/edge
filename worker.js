@@ -7,20 +7,23 @@ const FALLBACK_TIMEOUT = 10000;
 const WINDOW = 4194304; // or const WINDOW = 2097152;
 const BUDGET = 83886080;
 const QUEUE_LIMIT = 4194304;
-const FLUSH_SIZE = 32768;
-const FLUSH_MS = 2;
-const waiters = new Set();
+const FLUSH_SIZE = 65536;
+const FLUSH_MS = 8;
+const budgetWaiters = new Set();
 let total = 0;
 
-const wakeAll = () => {
-  for (const w of waiters) w();
-  waiters.clear();
+const wakeBudget = () => {
+  if (total > BUDGET || budgetWaiters.size === 0) return;
+  for (const w of budgetWaiters) w();
+  budgetWaiters.clear();
 };
 
-const U0 = 0xd342d11e;
-const U1 = 0xd4244583;
-const U2 = 0xb36e524a;
-const U3 = 0xb1f0afa4;
+const UUID_BYTES = Uint8Array.of(
+  0xd3, 0x42, 0xd1, 0x1e,
+  0xd4, 0x24, 0x45, 0x83,
+  0xb3, 0x6e, 0x52, 0x4a,
+  0xb1, 0xf0, 0xaf, 0xa4
+);
 
 const RESPONSE_HEADER = new Uint8Array(2);
 const HTML_HEADERS = { "Content-Type": "text/html; charset=utf-8", Server: "nginx" };
@@ -41,17 +44,72 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
 </body>
 </html>\r\n`;
 
+function parseUrlParts(raw) {
+  const schemeEnd = raw.indexOf("://");
+  const hostStart = schemeEnd >= 0 ? schemeEnd + 3 : 0;
+  const q = raw.indexOf("?", hostStart);
+  const slash = raw.indexOf("/", hostStart);
+  const pathStart = slash >= 0 && (q < 0 || slash < q) ? slash : -1;
+  const pathname = pathStart >= 0 ? raw.slice(pathStart, q >= 0 ? q : raw.length) : "/";
+  return { pathname, query: q >= 0 ? raw.slice(q + 1) : "" };
+}
+
+function getQueryParam(query, name) {
+  if (!query) return null;
+  const prefix = `${name}=`;
+  let start = 0;
+  while (start <= query.length) {
+    const amp = query.indexOf("&", start);
+    const end = amp >= 0 ? amp : query.length;
+    if (query.startsWith(prefix, start)) {
+      const val = query.slice(start + prefix.length, end);
+      try {
+        return decodeURIComponent(val);
+      } catch {
+        return val;
+      }
+    }
+    if (amp < 0) break;
+    start = amp + 1;
+  }
+  return null;
+}
+
+function parseHostPort(target, fallbackPort) {
+  if (!target) return { hostname: "", port: fallbackPort };
+  if (target[0] === "[") {
+    const closeIdx = target.indexOf("]");
+    if (closeIdx > 1) {
+      const hostname = target.slice(1, closeIdx);
+      const colonIdx = target.indexOf(":", closeIdx + 1);
+      const parsedPort = colonIdx > closeIdx ? +target.slice(colonIdx + 1) : 0;
+      return { hostname, port: parsedPort > 0 ? parsedPort : fallbackPort };
+    }
+  }
+  const colonIdx = target.indexOf(":");
+  if (colonIdx > 0 && target.indexOf(":", colonIdx + 1) < 0) {
+    const parsedPort = +target.slice(colonIdx + 1);
+    return {
+      hostname: target.slice(0, colonIdx),
+      port: parsedPort > 0 ? parsedPort : fallbackPort
+    };
+  }
+  return { hostname: target, port: fallbackPort };
+}
+
+const DEFAULT_PROXY = parseHostPort(PROXY_IP, 0);
+
 export default {
   fetch(req) {
-    const url = new URL(req.url);
+    const { pathname, query } = parseUrlParts(req.url);
 
-    if (url.pathname === WS_PATH && req.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+    if (pathname === WS_PATH && req.headers.get("Upgrade")?.toLowerCase() === "websocket") {
       const protocol = req.headers.get("Sec-WebSocket-Protocol");
       const { 0: client, 1: server } = new WebSocketPair();
       server.accept();
       server.binaryType = "arraybuffer";
       server.send(RESPONSE_HEADER);
-      handleTraffic(server, url.searchParams.get("proxyip"), protocol ? decodeEarly(protocol) : null);
+      handleTraffic(server, getQueryParam(query, "proxyip"), protocol ? decodeEarly(protocol) : null);
       return new Response(null, {
         status: 101,
         webSocket: client,
@@ -59,7 +117,7 @@ export default {
       });
     }
 
-    return url.pathname === "/"
+    return pathname === "/"
       ? new Response(NGINX_PAGE, { headers: HTML_HEADERS })
       : new Response("Not Found", { status: 404, headers: HTML_HEADERS });
   }
@@ -71,7 +129,7 @@ function decodeEarly(value) {
     if (bin.length < 18) return null;
     const out = new Uint8Array(bin.length);
     for (let i = 0; i < out.length; i++) out[i] = bin.charCodeAt(i);
-    return out.buffer;
+    return out;
   } catch {
     return null;
   }
@@ -98,7 +156,9 @@ async function dial(hostname, port, ms) {
 
 function handleTraffic(ws, customProxy, early) {
   let tcp = null;
+  let reader = null;
   let writer = null;
+  let closed = false;
   let started = !!early;
   let sent = 0;
   let acked = 0;
@@ -108,18 +168,25 @@ function handleTraffic(ws, customProxy, early) {
   let buf = [];
   let len = 0;
   let timer = 0;
+  let wake = null;
+  let globalWait = null;
   const queue = [];
+
+  const wakeStream = () => {
+    if (wake) {
+      const r = wake;
+      wake = null;
+      r();
+    }
+  };
 
   const sync = () => {
     const d = (credit ? Math.max(0, sent - acked) : 0) - acct;
     if (!d) return;
     acct += d;
     total += d;
-    if (d < 0) wakeAll();
+    if (d < 0) wakeBudget();
   };
-
-  const blocked = () =>
-    ws.readyState === 1 && credit && (sent + len - acked > WINDOW || total > BUDGET);
 
   const flush = () => {
     clearTimeout(timer);
@@ -128,12 +195,13 @@ function handleTraffic(ws, customProxy, early) {
     const n = len;
     buf = [];
     len = 0;
-    if (!n || ws.readyState !== 1) return;
+    if (!n || closed || ws.readyState !== 1) return;
     let out = parts[0];
     if (parts.length > 1) {
       out = new Uint8Array(n);
       let o = 0;
-      for (const c of parts) {
+      for (let i = 0; i < parts.length; i++) {
+        const c = parts[i];
         out.set(c, o);
         o += c.byteLength;
       }
@@ -144,59 +212,78 @@ function handleTraffic(ws, customProxy, early) {
       return close();
     }
     sent += n;
-    sync();
+    if (credit || acct !== 0) sync();
   };
 
   const close = () => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    timer = 0;
     try {
       if (ws.readyState === 1 || ws.readyState === 0) ws.close();
     } catch {}
+    if (reader) {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {}
+      reader = null;
+    }
     if (tcp) {
       tcp.close().catch(() => {});
       tcp = null;
     }
-    clearTimeout(timer);
+    writer = null;
+    queue.length = 0;
+    queued = 0;
     buf = [];
     len = 0;
     credit = false;
     sync();
-    wakeAll();
+    wakeStream();
+    if (globalWait) {
+      budgetWaiters.delete(globalWait);
+      const r = globalWait;
+      globalWait = null;
+      r();
+    }
+    wakeBudget();
   };
 
-  const start = async (data) => {
+  const start = async (u8) => {
     let host;
     let port;
     let offset;
 
     try {
-      const buffer = data instanceof ArrayBuffer ? data : data.buffer;
-      const byteOffset = data.byteOffset || 0;
-      const view = new DataView(buffer, byteOffset, data.byteLength);
-
-      if (
-        view.getUint32(1) !== U0 ||
-        view.getUint32(5) !== U1 ||
-        view.getUint32(9) !== U2 ||
-        view.getUint32(13) !== U3
-      ) {
-        return close();
+      const byteLength = u8.byteLength;
+      if (byteLength < 22) return close();
+      for (let i = 0; i < 16; i++) {
+        if (u8[1 + i] !== UUID_BYTES[i]) return close();
       }
 
-      const pIdx = 19 + view.getUint8(17);
-      port = view.getUint16(pIdx);
-      const type = view.getUint8(pIdx + 2);
+      const pIdx = 19 + u8[17];
+      if (pIdx + 3 > byteLength) return close();
+      port = (u8[pIdx] << 8) | u8[pIdx + 1];
+      const type = u8[pIdx + 2];
       offset = pIdx + 3;
 
       if (type === 1) {
-        host = `${view.getUint8(offset)}.${view.getUint8(offset + 1)}.${view.getUint8(offset + 2)}.${view.getUint8(offset + 3)}`;
+        if (offset + 4 > byteLength) return close();
+        host = `${u8[offset]}.${u8[offset + 1]}.${u8[offset + 2]}.${u8[offset + 3]}`;
         offset += 4;
       } else if (type === 2) {
-        const len = view.getUint8(offset++);
-        host = decoder.decode(new Uint8Array(buffer, byteOffset + offset, len));
-        offset += len;
+        if (offset >= byteLength) return close();
+        const dLen = u8[offset++];
+        if (offset + dLen > byteLength) return close();
+        host = decoder.decode(u8.subarray(offset, offset + dLen));
+        offset += dLen;
       } else if (type === 3) {
+        if (offset + 16 > byteLength) return close();
         const parts = new Array(8);
-        for (let i = 0; i < 8; i++, offset += 2) parts[i] = view.getUint16(offset).toString(16);
+        for (let i = 0; i < 8; i++, offset += 2) {
+          parts[i] = ((u8[offset] << 8) | u8[offset + 1]).toString(16);
+        }
         host = parts.join(":");
       } else {
         return close();
@@ -205,44 +292,62 @@ function handleTraffic(ws, customProxy, early) {
       return close();
     }
 
+    let dialed;
     try {
-      tcp = await dial(host, port, CONNECT_TIMEOUT);
+      dialed = await dial(host, port, CONNECT_TIMEOUT);
     } catch {
-      const proxyTarget = customProxy || PROXY_IP;
-      const [proxyHost, proxyPort] = proxyTarget.split(":");
+      if (closed || ws.readyState !== 1) return close();
+      const target = customProxy ? parseHostPort(customProxy, port) : DEFAULT_PROXY;
       try {
-        tcp = await dial(proxyHost, proxyPort ? +proxyPort : port, FALLBACK_TIMEOUT);
+        dialed = await dial(target.hostname, target.port || port, FALLBACK_TIMEOUT);
       } catch {
         return close();
       }
     }
 
-    if (ws.readyState !== 1) return close();
-
+    if (closed || ws.readyState !== 1) {
+      dialed.close().catch(() => {});
+      return close();
+    }
+    tcp = dialed;
     writer = tcp.writable.getWriter();
 
-    if (offset < data.byteLength) {
-      const initialChunk = new Uint8Array(
-        data instanceof ArrayBuffer ? data : data.buffer,
-        (data.byteOffset || 0) + offset,
-        data.byteLength - offset
-      );
-      writer.write(initialChunk).catch(close);
+    if (offset < u8.byteLength) {
+      writer.write(u8.subarray(offset)).catch(close);
     }
 
-    for (const chunk of queue) {
-      writer.write(chunk).catch(close);
+    for (let i = 0; i < queue.length; i++) {
+      if (closed) return;
+      writer.write(queue[i]).catch(close);
     }
     queue.length = 0;
+    queued = 0;
 
     (async () => {
-      const reader = tcp.readable.getReader();
+      reader = tcp.readable.getReader();
       try {
-        while (ws.readyState === 1) {
-          while (blocked()) {
+        while (!closed && ws.readyState === 1) {
+          while (!closed && ws.readyState === 1) {
+            const streamBlocked = credit && sent + len - acked > WINDOW;
+            const globalBlocked = !streamBlocked && credit && total > BUDGET;
+            if (!streamBlocked && !globalBlocked) break;
             flush();
-            await new Promise((r) => waiters.add(r));
+            if (closed || ws.readyState !== 1) break;
+            await new Promise((r) => {
+              if (streamBlocked) {
+                wake = r;
+              } else {
+                const gw = () => {
+                  budgetWaiters.delete(gw);
+                  if (globalWait === gw) globalWait = null;
+                  r();
+                };
+                globalWait = gw;
+                budgetWaiters.add(gw);
+              }
+            });
           }
+          if (closed || ws.readyState !== 1) break;
           const { done, value } = await reader.read();
           if (done) break;
           buf.push(value);
@@ -257,31 +362,40 @@ function handleTraffic(ws, customProxy, early) {
   };
 
   ws.addEventListener("message", ({ data }) => {
-    if (typeof data === "string") {
-      const n = Number(data);
-      if (n >= 0) {
-        credit = true;
-        if (n > acked) acked = n;
-        sync();
+    if (closed) return;
+    try {
+      if (typeof data === "string") {
+        const n = Number(data);
+        if (Number.isFinite(n) && n >= 0) {
+          credit = true;
+          if (n > acked) acked = n;
+          sync();
+          if (sent + len - acked <= WINDOW) wakeStream();
+        }
+        return;
       }
-      return;
-    }
-    const chunk = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      const chunk =
+        data instanceof ArrayBuffer
+          ? new Uint8Array(data)
+          : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 
-    if (writer) {
-      writer.write(chunk).catch(close);
-    } else if (started) {
-      queued += chunk.byteLength;
-      if (queued > QUEUE_LIMIT) return close();
-      queue.push(chunk);
-    } else {
-      started = true;
-      start(chunk).catch(close);
+      if (writer) {
+        writer.write(chunk).catch(close);
+      } else if (started) {
+        queued += chunk.byteLength;
+        if (queued > QUEUE_LIMIT) return close();
+        queue.push(chunk);
+      } else {
+        started = true;
+        start(chunk).catch(close);
+      }
+    } catch {
+      close();
     }
   });
 
   ws.addEventListener("close", close);
   ws.addEventListener("error", close);
 
-  if (early) start(new Uint8Array(early)).catch(close);
+  if (early) start(early).catch(close);
 }
